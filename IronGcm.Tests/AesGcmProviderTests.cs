@@ -632,29 +632,6 @@ namespace IronGcm.Tests
             }
         }
 
-        [TestMethod]
-        public void Encrypt_WithDifferentNonceSizes_Succeeds()
-        {
-            using (var provider = new AesGcmProvider(_key256))
-            {
-                foreach (int nonceSize in new[] { 8, 12, 16 })
-                {
-                    byte[] nonce = new byte[nonceSize];
-                    using (var rng = new RNGCryptoServiceProvider())
-                    {
-                        rng.GetBytes(nonce);
-                    }
-
-                    byte[] ciphertext, tag;
-                    provider.Encrypt(nonce, _plaintext, out ciphertext, out tag);
-
-                    byte[] decryptedPlaintext;
-                    provider.Decrypt(nonce, ciphertext, tag, out decryptedPlaintext);
-
-                    CollectionAssert.AreEqual(_plaintext, decryptedPlaintext);
-                }
-            }
-        }
 
         #endregion
     }

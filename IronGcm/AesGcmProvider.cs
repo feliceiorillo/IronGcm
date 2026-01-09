@@ -11,7 +11,7 @@ namespace IronGcm
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This class provides authenticated encryption with associated data (AEAD) using the AES-GCM algorithm.
+    /// This class provides authenticated encryption with associated data (AEAD) using the AES-GMC algorithm.
     /// It leverages the native Windows Cryptography Next Generation (CNG) API for optimal performance and security.
     /// </para>
     /// <para>
@@ -63,7 +63,7 @@ namespace IronGcm
         private const string BCRYPT_CHAIN_MODE_GCM = "ChainingModeGCM";
         
         private readonly BCryptAlgorithmHandle _algorithmHandle;
-        private readonly BCryptKeyHandle _keyHandle;
+        private readonly byte[] _keyData;
         private readonly object _lock = new object();
         private bool _disposed;
 
@@ -81,6 +81,9 @@ namespace IronGcm
             
             if (key.Length != 16 && key.Length != 24 && key.Length != 32)
                 throw new ArgumentException("Key must be 16, 24, or 32 bytes.", nameof(key));
+
+            _keyData = new byte[key.Length];
+            Array.Copy(key, _keyData, key.Length);
 
             try
             {
@@ -105,19 +108,6 @@ namespace IronGcm
 
                 if (status != STATUS_SUCCESS)
                     throw new CryptographicException($"BCryptSetProperty failed with NTSTATUS: 0x{status:X8}");
-
-                // Generate key handle
-                status = BCryptGenerateSymmetricKey(
-                    _algorithmHandle,
-                    out _keyHandle,
-                    IntPtr.Zero,
-                    0,
-                    key,
-                    key.Length,
-                    0);
-
-                if (status != STATUS_SUCCESS)
-                    throw new CryptographicException($"BCryptGenerateSymmetricKey failed with NTSTATUS: 0x{status:X8}");
             }
             catch
             {
@@ -158,44 +148,90 @@ namespace IronGcm
             {
                 ThrowIfDisposed();
 
-                const int tagSize = 16; // 128-bit tag
+                const int tagSize = 16;
                 ciphertext = new byte[plaintext.Length];
                 tag = new byte[tagSize];
 
-                BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = CreateAuthInfo(nonce, associatedData, tag);
-                
-                GCHandle nonceHandle = GCHandle.Alloc(nonce, GCHandleType.Pinned);
-                GCHandle aadHandle = associatedData != null ? GCHandle.Alloc(associatedData, GCHandleType.Pinned) : default(GCHandle);
-                GCHandle tagHandle = GCHandle.Alloc(tag, GCHandleType.Pinned);
-                GCHandle authInfoHandle = GCHandle.Alloc(authInfo, GCHandleType.Pinned);
+                // Create a new key handle for this operation
+                BCryptKeyHandle keyHandle;
+                uint status = BCryptGenerateSymmetricKey(
+                    _algorithmHandle,
+                    out keyHandle,
+                    IntPtr.Zero,
+                    0,
+                    _keyData,
+                    _keyData.Length,
+                    0);
+
+                if (status != STATUS_SUCCESS)
+                    throw new CryptographicException($"BCryptGenerateSymmetricKey failed with NTSTATUS: 0x{status:X8}");
 
                 try
                 {
-                    int bytesWritten;
-                    uint status = BCryptEncrypt(
-                        _keyHandle,
-                        plaintext,
-                        plaintext.Length,
-                        authInfoHandle.AddrOfPinnedObject(),
-                        null,
-                        0,
-                        ciphertext,
-                        ciphertext.Length,
-                        out bytesWritten,
-                        0);
+                    GCHandle nonceHandle = GCHandle.Alloc(nonce, GCHandleType.Pinned);
+                    GCHandle aadHandle = (associatedData != null && associatedData.Length > 0) ? GCHandle.Alloc(associatedData, GCHandleType.Pinned) : default(GCHandle);
+                    GCHandle tagHandle = GCHandle.Alloc(tag, GCHandleType.Pinned);
+                    GCHandle plaintextHandle = plaintext.Length > 0 ? GCHandle.Alloc(plaintext, GCHandleType.Pinned) : default(GCHandle);
+                    GCHandle ciphertextHandle = ciphertext.Length > 0 ? GCHandle.Alloc(ciphertext, GCHandleType.Pinned) : default(GCHandle);
 
-                    if (status != STATUS_SUCCESS)
-                        throw new CryptographicException($"BCryptEncrypt failed with NTSTATUS: 0x{status:X8}");
+                    try
+                    {
+                        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = new BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO();
+                        authInfo.cbSize = Marshal.SizeOf(typeof(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO));
+                        authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+                        authInfo.pbNonce = nonceHandle.AddrOfPinnedObject();
+                        authInfo.cbNonce = nonce.Length;
+                        authInfo.pbTag = tagHandle.AddrOfPinnedObject();
+                        authInfo.cbTag = tag.Length;
+                        
+                        if (associatedData != null && associatedData.Length > 0)
+                        {
+                            authInfo.pbAuthData = aadHandle.AddrOfPinnedObject();
+                            authInfo.cbAuthData = associatedData.Length;
+                        }
+                        else
+                        {
+                            authInfo.pbAuthData = IntPtr.Zero;
+                            authInfo.cbAuthData = 0;
+                        }
+                        
+                        authInfo.pbMacContext = IntPtr.Zero;
+                        authInfo.cbMacContext = 0;
+                        authInfo.cbAAD = 0;
+                        authInfo.cbData = 0;
+                        authInfo.dwFlags = 0;
 
-                    if (bytesWritten != plaintext.Length)
-                        throw new CryptographicException($"Unexpected ciphertext length: {bytesWritten} (expected {plaintext.Length})");
+                        int bytesWritten;
+                        status = BCryptEncrypt(
+                            keyHandle,
+                            plaintext.Length > 0 ? plaintext : null,
+                            plaintext.Length,
+                            ref authInfo,
+                            IntPtr.Zero,
+                            0,
+                            ciphertext.Length > 0 ? ciphertext : null,
+                            ciphertext.Length,
+                            out bytesWritten,
+                            0);
+
+                        if (status != STATUS_SUCCESS)
+                            throw new CryptographicException($"BCryptEncrypt failed with NTSTATUS: 0x{status:X8}");
+
+                        if (bytesWritten != plaintext.Length)
+                            throw new CryptographicException($"Unexpected ciphertext length: {bytesWritten} (expected {plaintext.Length})");
+                    }
+                    finally
+                    {
+                        if (nonceHandle.IsAllocated) nonceHandle.Free();
+                        if (aadHandle.IsAllocated) aadHandle.Free();
+                        if (tagHandle.IsAllocated) tagHandle.Free();
+                        if (plaintextHandle.IsAllocated) plaintextHandle.Free();
+                        if (ciphertextHandle.IsAllocated) ciphertextHandle.Free();
+                    }
                 }
                 finally
                 {
-                    if (nonceHandle.IsAllocated) nonceHandle.Free();
-                    if (aadHandle.IsAllocated) aadHandle.Free();
-                    if (tagHandle.IsAllocated) tagHandle.Free();
-                    if (authInfoHandle.IsAllocated) authInfoHandle.Free();
+                    keyHandle?.Dispose();
                 }
             }
         }
@@ -239,74 +275,91 @@ namespace IronGcm
 
                 plaintext = new byte[ciphertext.Length];
 
-                BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = CreateAuthInfo(nonce, associatedData, tag);
+                // Create a new key handle for this operation
+                BCryptKeyHandle keyHandle;
+                uint status = BCryptGenerateSymmetricKey(
+                    _algorithmHandle,
+                    out keyHandle,
+                    IntPtr.Zero,
+                    0,
+                    _keyData,
+                    _keyData.Length,
+                    0);
 
-                GCHandle nonceHandle = GCHandle.Alloc(nonce, GCHandleType.Pinned);
-                GCHandle aadHandle = associatedData != null ? GCHandle.Alloc(associatedData, GCHandleType.Pinned) : default(GCHandle);
-                GCHandle tagHandle = GCHandle.Alloc(tag, GCHandleType.Pinned);
-                GCHandle authInfoHandle = GCHandle.Alloc(authInfo, GCHandleType.Pinned);
+                if (status != STATUS_SUCCESS)
+                    throw new CryptographicException($"BCryptGenerateSymmetricKey failed with NTSTATUS: 0x{status:X8}");
 
                 try
                 {
-                    int bytesWritten;
-                    uint status = BCryptDecrypt(
-                        _keyHandle,
-                        ciphertext,
-                        ciphertext.Length,
-                        authInfoHandle.AddrOfPinnedObject(),
-                        null,
-                        0,
-                        plaintext,
-                        plaintext.Length,
-                        out bytesWritten,
-                        0);
+                    GCHandle nonceHandle = GCHandle.Alloc(nonce, GCHandleType.Pinned);
+                    GCHandle aadHandle = (associatedData != null && associatedData.Length > 0) ? GCHandle.Alloc(associatedData, GCHandleType.Pinned) : default(GCHandle);
+                    GCHandle tagHandle = GCHandle.Alloc(tag, GCHandleType.Pinned);
+                    GCHandle ciphertextHandle = ciphertext.Length > 0 ? GCHandle.Alloc(ciphertext, GCHandleType.Pinned) : default(GCHandle);
+                    GCHandle plaintextHandle = plaintext.Length > 0 ? GCHandle.Alloc(plaintext, GCHandleType.Pinned) : default(GCHandle);
 
-                    if (status == STATUS_AUTH_TAG_MISMATCH)
-                        throw new CryptographicException("Authentication tag mismatch. The ciphertext or tag has been tampered with.");
+                    try
+                    {
+                        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = new BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO();
+                        authInfo.cbSize = Marshal.SizeOf(typeof(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO));
+                        authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+                        authInfo.pbNonce = nonceHandle.AddrOfPinnedObject();
+                        authInfo.cbNonce = nonce.Length;
+                        authInfo.pbTag = tagHandle.AddrOfPinnedObject();
+                        authInfo.cbTag = tag.Length;
+                        
+                        if (associatedData != null && associatedData.Length > 0)
+                        {
+                            authInfo.pbAuthData = aadHandle.AddrOfPinnedObject();
+                            authInfo.cbAuthData = associatedData.Length;
+                        }
+                        else
+                        {
+                            authInfo.pbAuthData = IntPtr.Zero;
+                            authInfo.cbAuthData = 0;
+                        }
+                        
+                        authInfo.pbMacContext = IntPtr.Zero;
+                        authInfo.cbMacContext = 0;
+                        authInfo.cbAAD = 0;
+                        authInfo.cbData = 0;
+                        authInfo.dwFlags = 0;
 
-                    if (status != STATUS_SUCCESS)
-                        throw new CryptographicException($"BCryptDecrypt failed with NTSTATUS: 0x{status:X8}");
+                        int bytesWritten;
+                        status = BCryptDecrypt(
+                            keyHandle,
+                            ciphertext.Length > 0 ? ciphertext : null,
+                            ciphertext.Length,
+                            ref authInfo,
+                            IntPtr.Zero,
+                            0,
+                            plaintext.Length > 0 ? plaintext : null,
+                            plaintext.Length,
+                            out bytesWritten,
+                            0);
 
-                    if (bytesWritten != ciphertext.Length)
-                        throw new CryptographicException($"Unexpected plaintext length: {bytesWritten} (expected {ciphertext.Length})");
+                        if (status == STATUS_AUTH_TAG_MISMATCH)
+                            throw new CryptographicException("Authentication tag mismatch. The ciphertext or tag has been tampered with.");
+
+                        if (status != STATUS_SUCCESS)
+                            throw new CryptographicException($"BCryptDecrypt failed with NTSTATUS: 0x{status:X8}");
+
+                        if (bytesWritten != ciphertext.Length)
+                            throw new CryptographicException($"Unexpected plaintext length: {bytesWritten} (expected {ciphertext.Length})");
+                    }
+                    finally
+                    {
+                        if (nonceHandle.IsAllocated) nonceHandle.Free();
+                        if (aadHandle.IsAllocated) aadHandle.Free();
+                        if (tagHandle.IsAllocated) tagHandle.Free();
+                        if (ciphertextHandle.IsAllocated) ciphertextHandle.Free();
+                        if (plaintextHandle.IsAllocated) plaintextHandle.Free();
+                    }
                 }
                 finally
                 {
-                    if (nonceHandle.IsAllocated) nonceHandle.Free();
-                    if (aadHandle.IsAllocated) aadHandle.Free();
-                    if (tagHandle.IsAllocated) tagHandle.Free();
-                    if (authInfoHandle.IsAllocated) authInfoHandle.Free();
+                    keyHandle?.Dispose();
                 }
             }
-        }
-
-        /// <summary>
-        /// Creates and initializes the BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO structure for GCM operations.
-        /// </summary>
-        /// <param name="nonce">The nonce/IV to use.</param>
-        /// <param name="aad">The additional authenticated data (AAD), or null if not used.</param>
-        /// <param name="tag">The authentication tag buffer.</param>
-        /// <returns>An initialized BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO structure.</returns>
-        private BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO CreateAuthInfo(byte[] nonce, byte[] aad, byte[] tag)
-        {
-            BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = new BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
-            {
-                cbSize = Marshal.SizeOf(typeof(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO)),
-                dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION,
-                pbNonce = Marshal.UnsafeAddrOfPinnedArrayElement(nonce, 0),
-                cbNonce = nonce.Length,
-                pbAuthData = aad != null ? Marshal.UnsafeAddrOfPinnedArrayElement(aad, 0) : IntPtr.Zero,
-                cbAuthData = aad?.Length ?? 0,
-                pbTag = Marshal.UnsafeAddrOfPinnedArrayElement(tag, 0),
-                cbTag = tag.Length,
-                pbMacContext = IntPtr.Zero,
-                cbMacContext = 0,
-                cbAAD = 0,
-                cbData = 0,
-                dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG
-            };
-
-            return authInfo;
         }
 
         /// <summary>
@@ -333,7 +386,9 @@ namespace IronGcm
 
             _disposed = true;
 
-            _keyHandle?.Dispose();
+            if (_keyData != null)
+                Array.Clear(_keyData, 0, _keyData.Length);
+
             _algorithmHandle?.Dispose();
         }
 
@@ -342,7 +397,6 @@ namespace IronGcm
         private const uint STATUS_SUCCESS = 0x00000000;
         private const uint STATUS_AUTH_TAG_MISMATCH = 0xC000A002;
         private const int BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION = 1;
-        private const int BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG = 0x00000001;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
@@ -358,7 +412,7 @@ namespace IronGcm
             public IntPtr pbMacContext;
             public int cbMacContext;
             public int cbAAD;
-            public int cbData;
+            public long cbData;
             public int dwFlags;
         }
 
@@ -417,8 +471,8 @@ namespace IronGcm
             BCryptKeyHandle hKey,
             [In] byte[] pbInput,
             int cbInput,
-            IntPtr pPaddingInfo,
-            [In, Out] byte[] pbIV,
+            ref BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO pPaddingInfo,
+            IntPtr pbIV,
             int cbIV,
             [Out] byte[] pbOutput,
             int cbOutput,
@@ -430,8 +484,8 @@ namespace IronGcm
             BCryptKeyHandle hKey,
             [In] byte[] pbInput,
             int cbInput,
-            IntPtr pPaddingInfo,
-            [In, Out] byte[] pbIV,
+            ref BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO pPaddingInfo,
+            IntPtr pbIV,
             int cbIV,
             [Out] byte[] pbOutput,
             int cbOutput,
