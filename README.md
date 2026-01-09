@@ -371,17 +371,6 @@ dotnet test
 ```
 or via Visual Studio Test Explorer.
 
-## License
-
-[Specify your license here]
-
-## Contributing
-
-[Specify contribution guidelines here]
-
-## Support
-
-[Specify support channels here]
 
 ## See Also
 
